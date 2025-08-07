@@ -34,7 +34,7 @@
  *****************************************************************************/
 
 #pragma once
-#if defined(_REENTRANT)
+#if !defined(IPS4O_SEQUENTIAL)
 
 #include <algorithm>
 #include <atomic>

@@ -42,7 +42,9 @@
 #include <numeric>
 #include <vector>
 
+#if !defined(IPS4O_SEQUENTIAL)
 #include <tbb/concurrent_queue.h>
+#endif
 
 namespace ips4o {
 namespace detail {
@@ -117,8 +119,9 @@ class Scheduler {
  public:
     Scheduler(size_t num_threads) : m_num_idle_threads(0), m_num_threads(num_threads) {}
 
+#if !defined(IPS4O_SEQUENTIAL)
     bool getJob(PrivateQueue<Job>& my_queue, Job& j) {
-        // Jobry to get local job.
+        // Try to get local job.
         if (!my_queue.empty()) {
             j = my_queue.popBack();
             return true;
@@ -157,11 +160,14 @@ class Scheduler {
     void addJob(const Job& j) { m_glob_queue.push(j); }
 
     void addJob(const Job&& j) { m_glob_queue.push(j); }
+#endif
 
     void reset() { m_num_idle_threads.store(0, std::memory_order_relaxed); }
 
  protected:
+#if !defined(IPS4O_SEQUENTIAL)
     tbb::concurrent_queue<Job> m_glob_queue;
+#endif
     std::atomic_uint64_t m_num_idle_threads;
     const size_t m_num_threads;
 };

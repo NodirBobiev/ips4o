@@ -47,7 +47,8 @@ if (NOT IPS4O_DISABLE_PARALLEL)
   target_link_libraries(ips4o INTERFACE TBB::tbb)
 
   target_link_libraries(ips4o INTERFACE atomic)
-  
+else()
+  target_compile_definitions(ips4o INTERFACE IPS4O_SEQUENTIAL)
 endif()
 message(STATUS "Parallel support of IPS4o disabled: ${IPS4O_DISABLE_PARALLEL}")
 

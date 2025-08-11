@@ -4,6 +4,7 @@
 #include <stack>
 #include <functional>
 #include <random>
+#include <vector>
 #include "ips4o/config.hpp"
 
 namespace ips4o_sm {
@@ -28,11 +29,27 @@ public:
     using difference_type = typename std::iterator_traits<Iterator>::difference_type;
     using comparator = Comparator;
 
+    enum class TaskType {
+        MAIN_SORT,
+        SAMPLE_SORT
+    };
+    
     struct Task {
         iterator begin;
         iterator end;
+        TaskType type;
         
-        Task(iterator b, iterator e) : begin(b), end(e) {}
+        // Context-specific data to avoid corruption in nested operations
+        std::vector<value_type> splitters;
+        std::vector<difference_type> bucket_counts;
+        std::vector<difference_type> bucket_starts;
+        difference_type num_samples;
+        difference_type step;
+        int log_buckets;
+        int num_buckets;
+        
+        Task(iterator b, iterator e, TaskType t = TaskType::MAIN_SORT) 
+            : begin(b), end(e), type(t), num_samples(0), step(0), log_buckets(0), num_buckets(0) {}
     };
 
 private:
@@ -47,12 +64,8 @@ private:
     difference_type current_size_;
     bool simple_case_handled_;
     
-    // Sampling state data
-    bool sample_sorting_in_progress_;
-    difference_type num_samples_;
-    difference_type step_;
-    int log_buckets_;
-    int num_buckets_;
+    // Current task context (to avoid using member variables that could be corrupted)
+    Task* current_task_context_;
     
 public:
     StateMachine(iterator begin, iterator end, comparator comp = comparator{})
@@ -62,11 +75,7 @@ public:
         , comp_(comp)
         , current_size_(end - begin)
         , simple_case_handled_(false)
-        , sample_sorting_in_progress_(false)
-        , num_samples_(0)
-        , step_(0)
-        , log_buckets_(0)
-        , num_buckets_(0) {
+        , current_task_context_(nullptr) {
     }
     
     void run() {
@@ -176,62 +185,139 @@ private:
     }
     
     void handle_sampling() {
-        if (!sample_sorting_in_progress_) {
+        // Check if we're returning from sample sorting
+        if (!task_stack_.empty() && task_stack_.top().type == TaskType::SAMPLE_SORT) {
+            // Sample is sorted, now build classifier
+            Task& context = task_stack_.top();
+            context.splitters.clear();
+            auto splitter = begin_ + context.step - 1;
+            
+            // Choose the splitters from sorted sample
+            context.splitters.push_back(*splitter);
+            for (int i = 2; i < context.num_buckets; ++i) {
+                splitter += context.step;
+                // Skip duplicates
+                if (comp_(context.splitters.back(), *splitter)) {
+                    context.splitters.push_back(*splitter);
+                }
+            }
+            
+            // Initialize bucket counts
+            context.bucket_counts.assign(context.num_buckets, 0);
+            
+            // Restore original task
+            begin_ = context.begin;
+            end_ = context.end;
+            current_size_ = end_ - begin_;
+            current_task_context_ = &context;
+            
+            current_state_ = State::CLASSIFICATION;
+        } else {
             // First time in sampling - select sample and start sorting
             const auto n = current_size_;
-            log_buckets_ = Config::logBuckets(n);
-            num_buckets_ = 1 << log_buckets_;
-            step_ = std::max<difference_type>(1, Config::oversamplingFactor(n));
-            num_samples_ = std::min(step_ * num_buckets_ - 1, n / 2);
+            Task new_task(begin_, end_, TaskType::SAMPLE_SORT);
+            new_task.log_buckets = Config::logBuckets(n);
+            new_task.num_buckets = 1 << new_task.log_buckets;
+            new_task.step = std::max<difference_type>(1, Config::oversamplingFactor(n));
+            new_task.num_samples = std::min(new_task.step * new_task.num_buckets - 1, n / 2);
 
             // Select the sample - swap random elements to front
             auto remaining = n;
             auto sample_it = begin_;
-            for (difference_type i = 0; i < num_samples_; ++i) {
+            for (difference_type i = 0; i < new_task.num_samples; ++i) {
                 const auto random_idx = std::uniform_int_distribution<difference_type>(0, --remaining)(random_generator_);
                 std::swap(*sample_it, sample_it[random_idx]);
                 ++sample_it;
             }
 
             // Push current task to stack and sort sample
-            task_stack_.push(Task(begin_, end_));
-            end_ = begin_ + num_samples_;
-            current_size_ = num_samples_;
-            sample_sorting_in_progress_ = true;
+            task_stack_.push(new_task);
+            end_ = begin_ + new_task.num_samples;
+            current_size_ = new_task.num_samples;
             current_state_ = State::SIMPLE_CASES;
-        } else {
-            // Sample is sorted, now build classifier
-            auto splitter = begin_ + step_ - 1;
-            
-            // Choose the splitters (simplified - no actual classifier building yet)
-            // Skip duplicates and fill to next power of two
-            // For now, just transition to classification
-            
-            // Restore original task
-            Task original_task = task_stack_.top();
-            task_stack_.pop();
-            begin_ = original_task.begin;
-            end_ = original_task.end;
-            current_size_ = end_ - begin_;
-            sample_sorting_in_progress_ = false;
-            
-            current_state_ = State::CLASSIFICATION;
         }
     }
     
     void handle_classification() {
-        // Classify elements into buckets
+        if (!current_task_context_) return;
+        
+        // Classify each element into its target bucket
+        for (auto it = begin_; it != end_; ++it) {
+            // Find which bucket this element belongs to
+            int bucket = 0;
+            for (size_t i = 0; i < current_task_context_->splitters.size(); ++i) {
+                if (comp_(*it, current_task_context_->splitters[i])) {
+                    bucket = static_cast<int>(i);
+                    break;
+                }
+                bucket = static_cast<int>(i + 1);
+            }
+            
+            // Count elements per bucket
+            if (bucket < static_cast<int>(current_task_context_->bucket_counts.size())) {
+                current_task_context_->bucket_counts[bucket]++;
+            }
+        }
+        
         current_state_ = State::PARTITIONING;
     }
     
     void handle_partitioning() {
-        // Rearrange elements in-place
+        if (!current_task_context_) return;
+        
+        // Calculate bucket start positions
+        current_task_context_->bucket_starts.clear();
+        current_task_context_->bucket_starts.resize(current_task_context_->bucket_counts.size() + 1);
+        current_task_context_->bucket_starts[0] = 0;
+        for (size_t i = 0; i < current_task_context_->bucket_counts.size(); ++i) {
+            current_task_context_->bucket_starts[i + 1] = current_task_context_->bucket_starts[i] + current_task_context_->bucket_counts[i];
+        }
+        
+        // Simple in-place partitioning using stable_partition
+        auto current_pos = begin_;
+        for (size_t bucket = 0; bucket < current_task_context_->splitters.size() + 1; ++bucket) {
+            if (current_task_context_->bucket_counts[bucket] == 0) continue;
+            
+            auto bucket_end = std::stable_partition(current_pos, end_, 
+                [this, bucket](const value_type& val) {
+                    // Check if element belongs to current bucket
+                    if (bucket == 0) {
+                        return current_task_context_->splitters.empty() || comp_(val, current_task_context_->splitters[0]);
+                    } else if (bucket <= current_task_context_->splitters.size()) {
+                        bool greater_than_prev = bucket == 1 || !comp_(val, current_task_context_->splitters[bucket - 1]);
+                        bool less_than_curr = bucket > current_task_context_->splitters.size() || comp_(val, current_task_context_->splitters[bucket - 1]);
+                        return greater_than_prev && less_than_curr;
+                    }
+                    return false;
+                });
+            
+            current_pos = bucket_end;
+        }
+        
         current_state_ = State::RECURSION;
     }
     
     void handle_recursion() {
-        // Add buckets to task stack for recursive processing
-        // If task stack empty, we're done
+        if (current_task_context_) {
+            // Add buckets to task stack for recursive processing
+            const difference_type base_threshold = Config::kBaseCaseMultiplier * Config::kBaseCaseSize;
+            
+            // Add non-trivial buckets to task stack
+            for (size_t i = 0; i < current_task_context_->bucket_starts.size() - 1; ++i) {
+                const auto bucket_size = current_task_context_->bucket_starts[i + 1] - current_task_context_->bucket_starts[i];
+                if (bucket_size > base_threshold) {
+                    auto bucket_begin = begin_ + current_task_context_->bucket_starts[i];
+                    auto bucket_end = begin_ + current_task_context_->bucket_starts[i + 1];
+                    task_stack_.push(Task(bucket_begin, bucket_end, TaskType::MAIN_SORT));
+                }
+            }
+            
+            // Pop the completed sample sort task
+            task_stack_.pop();
+            current_task_context_ = nullptr;
+        }
+        
+        // Process next task or finish
         if (task_stack_.empty()) {
             current_state_ = State::DONE;
         } else {
@@ -241,8 +327,8 @@ private:
             end_ = next_task.end;
             current_size_ = end_ - begin_;
             
-            // Check if we're returning from sample sorting
-            if (sample_sorting_in_progress_) {
+            // Check task type to determine next state
+            if (next_task.type == TaskType::SAMPLE_SORT) {
                 current_state_ = State::SAMPLING;
             } else {
                 current_state_ = State::SIMPLE_CASES;

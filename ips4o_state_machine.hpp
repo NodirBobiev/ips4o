@@ -7,6 +7,7 @@
 #include <vector>
 #include <fstream>
 #include "ips4o/config.hpp"
+#include <iostream>
 
 using namespace std;
 
@@ -45,8 +46,7 @@ enum class State {
     BASE_CASE,
     SAMPLE_SELECT,
     SAMPLE_SORTED,
-    CLASSIFY,
-    PARTITION,
+    PARTITION,  // Combined classification + partitioning in single pass
     RECURSE
 };
 
@@ -55,7 +55,6 @@ std::vector<std::string> state_names = {
     "BASE_CASE",
     "SAMPLE_SELECT",
     "SAMPLE_SORTED",
-    "CLASSIFY",
     "PARTITION",
     "RECURSE"
 };
@@ -81,8 +80,7 @@ public:
         difference_type num_samples;
         difference_type step;
         int log_buckets;
-        int num_buckets;
-        
+        int num_buckets;  
         Task(iterator b, iterator e, State s = State::SIMPLE_CASES) 
             : begin(b), end(e), state(s), num_samples(0), step(0), log_buckets(0), num_buckets(0) {}
     };
@@ -124,9 +122,6 @@ public:
                 break;
             case State::SAMPLE_SORTED:
                 handle_sample_sorted();
-                break;
-            case State::CLASSIFY:
-                handle_classify();
                 break;
             case State::PARTITION:
                 handle_partition();
@@ -271,42 +266,11 @@ private:
             }
         }
 
-        // Initialize bucket counts and transition to classification
-        context.bucket_counts.assign(context.splitters.size() + 1, 0);
-        context.state = State::CLASSIFY;
+        // Skip classification - go directly to combined partitioning
+        context.state = State::PARTITION;
         LOG("splitters: ");
         for (auto splitter : context.splitters) {
             LOG(splitter, " ");
-        }
-        LOG("\n");
-        LOGW(" -> CLASSIFY\n");
-    }
-    
-    void handle_classify() {
-        Task& current_task = task_stack_.top();
-        
-        LOGW("CLASSIFY: Processing ", current_task.end - current_task.begin, " elements with ", current_task.splitters.size(), " splitters\n");
-        
-        // Classify each element into its target bucket using binary search (O(n log k) instead of O(n*k))
-        for (auto it = current_task.begin; it != current_task.end; ++it) {
-            // Use std::lower_bound for O(log k) classification instead of O(k) linear search
-            int bucket = static_cast<int>(
-                std::lower_bound(current_task.splitters.begin(), 
-                               current_task.splitters.end(), 
-                               *it, comp_) 
-                - current_task.splitters.begin()
-            );
-            
-            // Count elements per bucket
-            if (bucket < static_cast<int>(current_task.bucket_counts.size())) {
-                current_task.bucket_counts[bucket]++;
-            }
-        }
-        
-        current_task.state = State::PARTITION;
-        LOG("bucket_counts: ");
-        for (auto bucket : current_task.bucket_counts) {
-            LOG(bucket, " ");
         }
         LOG("\n");
         LOGW(" -> PARTITION\n");
@@ -315,16 +279,16 @@ private:
     void handle_partition() {
         Task& current_task = task_stack_.top();
         
-        LOGW("PARTITION: Starting with ", current_task.splitters.size(), " splitters\n");
+        LOGW("PARTITION: Single-pass partitioning ", current_task.end - current_task.begin, " elements with ", current_task.splitters.size(), " splitters\n");
         
-        // Use in-place partitioning with std::partition for better performance (Issue #5)
+        // Direct multi-way partitioning in single pass - no separate classification step!
         current_task.bucket_starts.clear();
         current_task.bucket_starts.push_back(0);
         
         auto current_begin = current_task.begin;
         auto current_end = current_task.end;
         
-        // Partition sequentially using std::partition (much faster than temporary storage)
+        // Sequential partitioning using std::partition - single pass through remaining data
         for (size_t i = 0; i < current_task.splitters.size(); ++i) {
             const auto& splitter = current_task.splitters[i];
             

@@ -11,7 +11,6 @@
 
 using namespace std;
 
-// Re-enable logging as requested
 // #define LOG_FILENAME "logs_v3.txt"
 
 #ifdef LOG_FILENAME
@@ -46,8 +45,7 @@ enum class State {
     BASE_CASE,
     SAMPLE_SELECT,
     SAMPLE_SORTED,
-    PARTITION,  // Combined classification + partitioning in single pass
-    RECURSE
+    PARTITION 
 };
 
 std::vector<std::string> state_names = {
@@ -55,8 +53,7 @@ std::vector<std::string> state_names = {
     "BASE_CASE",
     "SAMPLE_SELECT",
     "SAMPLE_SORTED",
-    "PARTITION",
-    "RECURSE"
+    "PARTITION"
 };
 
 
@@ -69,20 +66,19 @@ public:
     using comparator = Comparator;
     
     struct Task {
+        std::vector<value_type> splitters;
+
         iterator begin;
         iterator end;
-        State state;  // Each task has its own state!
         
-        // Context-specific data to avoid corruption in nested operations
-        std::vector<value_type> splitters;
-        std::vector<difference_type> bucket_counts;
-        std::vector<difference_type> bucket_starts;
         difference_type num_samples;
         difference_type step;
-        int log_buckets;
-        int num_buckets;  
+        
+        State state; 
+        int num_buckets;
+
         Task(iterator b, iterator e, State s = State::SIMPLE_CASES) 
-            : begin(b), end(e), state(s), num_samples(0), step(0), log_buckets(0), num_buckets(0) {}
+            : begin(b), end(e), state(s), num_samples(0), step(0), num_buckets(0) {}
     };
 
 private:
@@ -126,9 +122,7 @@ public:
             case State::PARTITION:
                 handle_partition();
                 break;
-            case State::RECURSE:
-                handle_recurse();
-                break;
+
         }
         LOGW("------------------------------\n");
     }
@@ -213,12 +207,12 @@ private:
         const auto n = current_task.end - current_task.begin;
         Task context_task = current_task;  // Save current task context
         context_task.state = State::SAMPLE_SORTED;  // When we return, go to SAMPLE_SORTED
-        context_task.log_buckets = Config::logBuckets(n);
-        context_task.num_buckets = 1 << context_task.log_buckets;
+        const int log_buckets = Config::logBuckets(n);
+        context_task.num_buckets = 1 << log_buckets;
         context_task.step = std::max<difference_type>(1, Config::oversamplingFactor(n));
         context_task.num_samples = std::min(context_task.step * context_task.num_buckets - 1, n / 2);
 
-        LOGW("log_buckets:", context_task.log_buckets, "num_buckets:", context_task.num_buckets, "step:", context_task.step, "num_samples:", context_task.num_samples, "\n");
+        LOGW("log_buckets:", log_buckets, "num_buckets:", context_task.num_buckets, "step:", context_task.step, "num_samples:", context_task.num_samples, "\n");
 
         // Select the sample - swap random elements to front
         auto remaining = n;
@@ -277,61 +271,38 @@ private:
     }
     
     void handle_partition() {
-        Task& current_task = task_stack_.top();
-        
-        LOGW("PARTITION: Single-pass partitioning ", current_task.end - current_task.begin, " elements with ", current_task.splitters.size(), " splitters\n");
-        
-        // Direct multi-way partitioning in single pass - no separate classification step!
-        current_task.bucket_starts.clear();
-        current_task.bucket_starts.push_back(0);
-        
+        // Extract data we need before popping to avoid expensive task copying
+        const auto& current_task = task_stack_.top();
+        const auto splitters = std::move(const_cast<Task&>(current_task).splitters);  // Move splitters (no copy!)
         auto current_begin = current_task.begin;
         auto current_end = current_task.end;
+        task_stack_.pop();  // Pop current task immediately
         
-        // Sequential partitioning using std::partition - single pass through remaining data
-        for (size_t i = 0; i < current_task.splitters.size(); ++i) {
-            const auto& splitter = current_task.splitters[i];
+        LOGW("PARTITION: Single-pass partitioning ", current_end - current_begin, " elements with ", splitters.size(), " splitters\n");
+        
+        // Sequential partitioning with immediate task creation - no intermediate storage!
+        for (size_t i = 0; i < splitters.size(); ++i) {
+            const auto& splitter = splitters[i];
             
             // Partition: elements < splitter go to the left
             auto partition_point = std::partition(current_begin, current_end, 
                 [&](const value_type& val) { return comp_(val, splitter); });
             
-            current_task.bucket_starts.push_back(partition_point - current_task.begin);
-            current_begin = partition_point;
-        }
-        
-        // Last bucket contains remaining elements
-        current_task.bucket_starts.push_back(current_end - current_task.begin);
-        
-        LOG("bucket_starts: ");
-        for (auto bucket : current_task.bucket_starts) {
-            LOG(bucket, " ");
-        }
-        LOG("\n");
-        LOGW(" -> RECURSE\n");
-        
-        current_task.state = State::RECURSE;
-    }
-    
-    void handle_recurse() {
-        // Extract data we need before popping to avoid expensive task copying
-        const auto& current_task = task_stack_.top();
-        const auto bucket_starts = std::move(const_cast<Task&>(current_task).bucket_starts);
-        const auto begin_iter = current_task.begin;
-        task_stack_.pop();
-        
-        LOGW("RECURSE: Processing ", bucket_starts.size() - 1, " buckets\n");
-        
-        // Add buckets in reverse order for correct processing
-        for(int i = static_cast<int>(bucket_starts.size()) - 1; i > 0; --i) {
-            const int bucket_size = bucket_starts[i] - bucket_starts[i - 1];
-            LOGW("Bucket ", i-1, " size: ", bucket_size, "\n");
+            // Immediately push the bucket if it has >1 element
+            const auto bucket_size = partition_point - current_begin;
+            LOGW("Bucket ", i, " size: ", bucket_size, "\n");
             if(bucket_size > 1) {
-                auto bucket_begin = begin_iter + bucket_starts[i - 1];
-                auto bucket_end = begin_iter + bucket_starts[i];
-                // Use emplace instead of push to avoid unnecessary Task construction
-                task_stack_.emplace(bucket_begin, bucket_end, State::SIMPLE_CASES);
+                task_stack_.emplace(current_begin, partition_point, State::SIMPLE_CASES);
             }
+            
+            current_begin = partition_point;  // Move to next range
+        }
+        
+        // Handle final bucket (elements >= last splitter)
+        const auto final_bucket_size = current_end - current_begin;
+        LOGW("Final bucket size: ", final_bucket_size, "\n");
+        if(final_bucket_size > 1) {
+            task_stack_.emplace(current_begin, current_end, State::SIMPLE_CASES);
         }
     }
 };

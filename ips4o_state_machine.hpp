@@ -284,17 +284,18 @@ private:
     
     void handle_classify() {
         Task& current_task = task_stack_.top();
-        // Classify each element into its target bucket
+        
+        LOGW("CLASSIFY: Processing ", current_task.end - current_task.begin, " elements with ", current_task.splitters.size(), " splitters\n");
+        
+        // Classify each element into its target bucket using binary search (O(n log k) instead of O(n*k))
         for (auto it = current_task.begin; it != current_task.end; ++it) {
-            // Find which bucket this element belongs to
-            int bucket = 0;
-            for (size_t i = 0; i < current_task.splitters.size(); ++i) {
-                if (comp_(*it, current_task.splitters[i])) {
-                    bucket = static_cast<int>(i);
-                    break;
-                }
-                bucket = static_cast<int>(i + 1);
-            }
+            // Use std::lower_bound for O(log k) classification instead of O(k) linear search
+            int bucket = static_cast<int>(
+                std::lower_bound(current_task.splitters.begin(), 
+                               current_task.splitters.end(), 
+                               *it, comp_) 
+                - current_task.splitters.begin()
+            );
             
             // Count elements per bucket
             if (bucket < static_cast<int>(current_task.bucket_counts.size())) {

@@ -277,29 +277,33 @@ private:
         
         LOGW("PARTITION: Single-pass partitioning ", current_end - current_begin, " elements with ", splitters.size(), " splitters\n");
         
-        // Sequential partitioning with immediate task creation - no intermediate storage!
-        for (size_t i = 0; i < splitters.size(); ++i) {
-            const auto& splitter = splitters[i];
-            
-            // Partition: elements < splitter go to the left
-            auto partition_point = std::partition(current_begin, current_end, 
-                [&](const value_type& val) { return comp_(val, splitter); });
-            
-            // Immediately push the bucket if it has >1 element
-            const auto bucket_size = partition_point - current_begin;
-            LOGW("Bucket ", i, " size: ", bucket_size, "\n");
-            if(bucket_size > 1) {
-                task_stack_.emplace(current_begin, partition_point, State::SIMPLE_CASES);
-            }
-            
-            current_begin = partition_point;  // Move to next range
+        // Single-pass classification using binary search on sorted splitters
+        // Create bucket storage - splitters are already sorted from handle_sample_sorted()
+        std::vector<std::vector<value_type>> buckets(splitters.size() + 1);
+        
+        // Single pass: classify each element once using O(log k) binary search
+        for (auto it = current_begin; it != current_end; ++it) {
+            // Binary search on sorted splitters to find correct bucket
+            auto bucket_idx = std::lower_bound(splitters.begin(), splitters.end(), 
+                                             *it, comp_) - splitters.begin();
+            buckets[bucket_idx].push_back(std::move(*it));
         }
         
-        // Handle final bucket (elements >= last splitter)
-        const auto final_bucket_size = current_end - current_begin;
-        LOGW("Final bucket size: ", final_bucket_size, "\n");
-        if(final_bucket_size > 1) {
-            task_stack_.emplace(current_begin, current_end, State::SIMPLE_CASES);
+        // Write back to original range and create tasks for non-empty buckets
+        auto write_it = current_begin;
+        for (size_t i = 0; i < buckets.size(); ++i) {
+            const auto bucket_size = buckets[i].size();
+            LOGW("Bucket ", i, " size: ", bucket_size, "\n");
+            
+            if (bucket_size > 1) {
+                auto bucket_begin = write_it;
+                for (auto& elem : buckets[i]) {
+                    *write_it++ = std::move(elem);
+                }
+                task_stack_.emplace(bucket_begin, write_it, State::SIMPLE_CASES);
+            } else if (bucket_size == 1) {
+                *write_it++ = std::move(buckets[i][0]);
+            }
         }
     }
 };

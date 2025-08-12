@@ -5,19 +5,59 @@
 #include <functional>
 #include <random>
 #include <vector>
+#include <fstream>
 #include "ips4o/config.hpp"
+
+using namespace std;
+
+// Re-enable logging as requested
+// #define LOG_FILENAME "logs_v3.txt"
+
+#ifdef LOG_FILENAME
+    ofstream logFile(LOG_FILENAME);
+
+    // Regular argument
+    template<bool _, typename T>
+    void LogImpl(T&& arg) {
+        logFile << std::forward<T>(arg);
+    }
+
+    // Variadic unpacking
+    template<bool space, typename T, typename... Args>
+    void LogImpl(T&& first, Args&&... rest) {
+        logFile << std::forward<T>(first);
+        if constexpr(space && sizeof...(rest) > 0){
+            logFile<<' ';
+        }
+        LogImpl<space>(std::forward<Args>(rest)...);
+    }
+    #define LOG(...) LogImpl<false>(__VA_ARGS__)
+    #define LOGW(...)LogImpl<true>(__VA_ARGS__)
+#else
+    #define LOG(...)
+    #define LOGW(...)
+#endif
 
 namespace ips4o_sm {
 
 enum class State {
-    INIT,
     SIMPLE_CASES,
     BASE_CASE,
-    SAMPLING,
-    CLASSIFICATION,
-    PARTITIONING,
-    RECURSION,
-    DONE
+    SAMPLE_SELECT,
+    SAMPLE_SORTED,
+    CLASSIFY,
+    PARTITION,
+    RECURSE
+};
+
+std::vector<std::string> state_names = {
+    "SIMPLE_CASES",
+    "BASE_CASE",
+    "SAMPLE_SELECT",
+    "SAMPLE_SORTED",
+    "CLASSIFY",
+    "PARTITION",
+    "RECURSE"
 };
 
 
@@ -28,16 +68,11 @@ public:
     using value_type = typename std::iterator_traits<Iterator>::value_type;
     using difference_type = typename std::iterator_traits<Iterator>::difference_type;
     using comparator = Comparator;
-
-    enum class TaskType {
-        MAIN_SORT,
-        SAMPLE_SORT
-    };
     
     struct Task {
         iterator begin;
         iterator end;
-        TaskType type;
+        State state;  // Each task has its own state!
         
         // Context-specific data to avoid corruption in nested operations
         std::vector<value_type> splitters;
@@ -48,127 +83,117 @@ public:
         int log_buckets;
         int num_buckets;
         
-        Task(iterator b, iterator e, TaskType t = TaskType::MAIN_SORT) 
-            : begin(b), end(e), type(t), num_samples(0), step(0), log_buckets(0), num_buckets(0) {}
+        Task(iterator b, iterator e, State s = State::SIMPLE_CASES) 
+            : begin(b), end(e), state(s), num_samples(0), step(0), log_buckets(0), num_buckets(0) {}
     };
 
 private:
-    State current_state_;
-    iterator begin_;
-    iterator end_;
     comparator comp_;
     std::stack<Task> task_stack_;
     std::mt19937 random_generator_;
     
-    // State-specific data
-    difference_type current_size_;
-    bool simple_case_handled_;
-    
-    // Current task context (to avoid using member variables that could be corrupted)
-    Task* current_task_context_;
-    
 public:
     StateMachine(iterator begin, iterator end, comparator comp = comparator{})
-        : current_state_(State::INIT)
-        , begin_(begin)
-        , end_(end)
-        , comp_(comp)
-        , current_size_(end - begin)
-        , simple_case_handled_(false)
-        , current_task_context_(nullptr) {
+        : comp_(comp), random_generator_(std::random_device{}()) {
+        // Push initial task to stack
+        task_stack_.push(Task(begin, end, State::SIMPLE_CASES));
+        LOGW("StateMachine created with", end - begin, "elements\n");
     }
     
     void run() {
-        while (current_state_ != State::DONE) {
+        while (!task_stack_.empty()) {
             step();
         }
     }
     
     void step() {
-        switch (current_state_) {
-            case State::INIT:
-                handle_init();
-                break;
+        if (task_stack_.empty()) return;
+        
+        Task& current_task = task_stack_.top();
+        LOGW(state_names[static_cast<int>(current_task.state)], "elements:", current_task.end - current_task.begin, "begin:", *current_task.begin, "end:", *current_task.end, "\n");
+
+        switch (current_task.state) {
             case State::SIMPLE_CASES:
                 handle_simple_cases();
                 break;
             case State::BASE_CASE:
                 handle_base_case();
                 break;
-            case State::SAMPLING:
-                handle_sampling();
+            case State::SAMPLE_SELECT:
+                handle_sample_select();
                 break;
-            case State::CLASSIFICATION:
-                handle_classification();
+            case State::SAMPLE_SORTED:
+                handle_sample_sorted();
                 break;
-            case State::PARTITIONING:
-                handle_partitioning();
+            case State::CLASSIFY:
+                handle_classify();
                 break;
-            case State::RECURSION:
-                handle_recursion();
+            case State::PARTITION:
+                handle_partition();
                 break;
-            case State::DONE:
+            case State::RECURSE:
+                handle_recurse();
                 break;
         }
+        LOGW("------------------------------\n");
     }
-    
-    State get_state() const { return current_state_; }
+
+    bool is_done() const {
+        return task_stack_.empty();
+    }
     
 private:
-    void handle_init() {
-        current_size_ = end_ - begin_;
-        current_state_ = State::SIMPLE_CASES;
-    }
-    
     void handle_simple_cases() {
-        if (begin_ == end_) {
-            simple_case_handled_ = true;
-            current_state_ = State::DONE;
+        Task& current_task = task_stack_.top();        
+        if (current_task.begin == current_task.end) {
+            task_stack_.pop();
+            LOGW(" -> DONE (begin == end)\n");
             return;
         }
 
         // If last element is not smaller than first element,
         // test if input is sorted (input is not reverse sorted)
-        if (!comp_(*(end_ - 1), *begin_)) {
-            if (std::is_sorted(begin_, end_, comp_)) {
-                simple_case_handled_ = true;
-                current_state_ = State::DONE;
+        if (!comp_(*(current_task.end - 1), *current_task.begin)) {
+            if (std::is_sorted(current_task.begin, current_task.end, comp_)) {
+                task_stack_.pop();
+                LOGW(" -> DONE (sorted)\n");
                 return;
             }
         } else {
             // Check whether the input is reverse sorted
-            for (auto it = begin_; (it + 1) != end_; ++it) {
+            for (auto it = current_task.begin; (it + 1) != current_task.end; ++it) {
                 if (comp_(*it, *(it + 1))) {
-                    simple_case_handled_ = false;
-                    current_state_ = State::BASE_CASE;
+                    current_task.state = State::BASE_CASE;
+                    LOGW(" -> BASE_CASE\n");
                     return;
                 }
             }
-            std::reverse(begin_, end_);
-            simple_case_handled_ = true;
-            current_state_ = State::DONE;
+            std::reverse(current_task.begin, current_task.end);
+            task_stack_.pop();
+            LOGW(" -> DONE (reverse sorted)\n");
             return;
         }
 
-        simple_case_handled_ = false;
-        current_state_ = State::BASE_CASE;
+        current_task.state = State::BASE_CASE;
+        LOGW(" -> BASE_CASE\n");
     }
     
     void handle_base_case() {
+        Task& current_task = task_stack_.top();
         const difference_type base_threshold = Config::kBaseCaseMultiplier * Config::kBaseCaseSize;
-        
-        if (current_size_ <= base_threshold) {
+        if (current_task.end - current_task.begin <= base_threshold) {
             // Perform insertion sort
-            if (begin_ == end_) {
-                current_state_ = State::DONE;
+            if (current_task.begin == current_task.end) {
+                task_stack_.pop();
+                LOGW(" -> DONE (begin == end)\n");
                 return;
             }
             
-            for (auto it = begin_ + 1; it < end_; ++it) {
+            for (auto it = current_task.begin + 1; it < current_task.end; ++it) {
                 value_type val = std::move(*it);
-                if (comp_(val, *begin_)) {
-                    std::move_backward(begin_, it, it + 1);
-                    *begin_ = std::move(val);
+                if (comp_(val, *current_task.begin)) {
+                    std::move_backward(current_task.begin, it, it + 1);
+                    *current_task.begin = std::move(val);
                 } else {
                     auto cur = it;
                     for (auto next = it - 1; comp_(val, *next); --next) {
@@ -178,75 +203,93 @@ private:
                     *cur = std::move(val);
                 }
             }
-            current_state_ = State::DONE;
+            task_stack_.pop();
+            LOGW(" -> DONE (insertion sort)\n");
         } else {
-            current_state_ = State::SAMPLING;
+            current_task.state = State::SAMPLE_SELECT;
+            LOGW(" -> SAMPLE_SELECT\n");
         }
     }
     
-    void handle_sampling() {
-        // Check if we're returning from sample sorting
-        if (!task_stack_.empty() && task_stack_.top().type == TaskType::SAMPLE_SORT) {
-            // Sample is sorted, now build classifier
-            Task& context = task_stack_.top();
-            context.splitters.clear();
-            auto splitter = begin_ + context.step - 1;
+    void handle_sample_select() {
+        Task& current_task = task_stack_.top();
+        
+        // First time in sampling - select sample and start sorting
+        const auto n = current_task.end - current_task.begin;
+        Task context_task = current_task;  // Save current task context
+        context_task.state = State::SAMPLE_SORTED;  // When we return, go to SAMPLE_SORTED
+        context_task.log_buckets = Config::logBuckets(n);
+        context_task.num_buckets = 1 << context_task.log_buckets;
+        context_task.step = std::max<difference_type>(1, Config::oversamplingFactor(n));
+        context_task.num_samples = std::min(context_task.step * context_task.num_buckets - 1, n / 2);
+
+        LOGW("log_buckets:", context_task.log_buckets, "num_buckets:", context_task.num_buckets, "step:", context_task.step, "num_samples:", context_task.num_samples, "\n");
+
+        // Select the sample - swap random elements to front
+        auto remaining = n;
+        auto sample_it = current_task.begin;
+        for (difference_type i = 0; i < context_task.num_samples; ++i) {
+            const auto random_idx = std::uniform_int_distribution<difference_type>(0, --remaining)(random_generator_);
+            std::swap(*sample_it, *(sample_it + random_idx));
+            ++sample_it;
+        }
+        
+        
+        // Replace current task with context and push sample sort task
+        task_stack_.top() = context_task;
+        task_stack_.push(Task(current_task.begin, current_task.begin + context_task.num_samples, State::SIMPLE_CASES));
+        
+        LOG("samples: ");
+        for (auto it = current_task.begin; it != current_task.begin + context_task.num_samples; ++it) {
+            LOG(*it, " ");
+        }
+        LOG("\n");
+        LOGW(" -> SIMPLE_CASES (sample sort)\n");
+    }
+    
+    void handle_sample_sorted() {        
+        // Get the context task (now on top)
+        Task& context = task_stack_.top();
+        
+        // Build splitters from sorted sample
+        context.splitters.clear();
+        
+        if (context.num_samples > 0 && context.step > 0) {
+            auto sample_end = context.begin + context.num_samples;
+            auto splitter = context.begin + context.step - 1;
             
-            // Choose the splitters from sorted sample
-            context.splitters.push_back(*splitter);
-            for (int i = 2; i < context.num_buckets; ++i) {
+            while (splitter < sample_end && context.splitters.size() < static_cast<size_t>(context.num_buckets - 1)) {
+                context.splitters.push_back(*splitter);
                 splitter += context.step;
+                
                 // Skip duplicates
-                if (comp_(context.splitters.back(), *splitter)) {
-                    context.splitters.push_back(*splitter);
+                while (splitter < sample_end && 
+                       !context.splitters.empty() && 
+                       !comp_(context.splitters.back(), *splitter)) {
+                    splitter += context.step;
                 }
             }
-            
-            // Initialize bucket counts
-            context.bucket_counts.assign(context.num_buckets, 0);
-            
-            // Restore original task
-            begin_ = context.begin;
-            end_ = context.end;
-            current_size_ = end_ - begin_;
-            current_task_context_ = &context;
-            
-            current_state_ = State::CLASSIFICATION;
-        } else {
-            // First time in sampling - select sample and start sorting
-            const auto n = current_size_;
-            Task new_task(begin_, end_, TaskType::SAMPLE_SORT);
-            new_task.log_buckets = Config::logBuckets(n);
-            new_task.num_buckets = 1 << new_task.log_buckets;
-            new_task.step = std::max<difference_type>(1, Config::oversamplingFactor(n));
-            new_task.num_samples = std::min(new_task.step * new_task.num_buckets - 1, n / 2);
-
-            // Select the sample - swap random elements to front
-            auto remaining = n;
-            auto sample_it = begin_;
-            for (difference_type i = 0; i < new_task.num_samples; ++i) {
-                const auto random_idx = std::uniform_int_distribution<difference_type>(0, --remaining)(random_generator_);
-                std::swap(*sample_it, sample_it[random_idx]);
-                ++sample_it;
-            }
-
-            // Push current task to stack and sort sample
-            task_stack_.push(new_task);
-            end_ = begin_ + new_task.num_samples;
-            current_size_ = new_task.num_samples;
-            current_state_ = State::SIMPLE_CASES;
         }
+
+        // Initialize bucket counts and transition to classification
+        context.bucket_counts.assign(context.splitters.size() + 1, 0);
+        context.state = State::CLASSIFY;
+        LOG("splitters: ");
+        for (auto splitter : context.splitters) {
+            LOG(splitter, " ");
+        }
+        LOG("\n");
+        LOGW(" -> CLASSIFY\n");
     }
     
-    void handle_classification() {
-        if (!current_task_context_) return;
-        
+    void handle_classify() {
+        Task& current_task = task_stack_.top();
         // Classify each element into its target bucket
-        for (auto it = begin_; it != end_; ++it) {
+        for (auto it = current_task.begin; it != current_task.end; ++it) {
             // Find which bucket this element belongs to
             int bucket = 0;
-            for (size_t i = 0; i < current_task_context_->splitters.size(); ++i) {
-                if (comp_(*it, current_task_context_->splitters[i])) {
+            for (size_t i = 0; i < current_task.splitters.size(); ++i) {
+                if (comp_(*it, current_task.splitters[i])) {
                     bucket = static_cast<int>(i);
                     break;
                 }
@@ -254,84 +297,75 @@ private:
             }
             
             // Count elements per bucket
-            if (bucket < static_cast<int>(current_task_context_->bucket_counts.size())) {
-                current_task_context_->bucket_counts[bucket]++;
+            if (bucket < static_cast<int>(current_task.bucket_counts.size())) {
+                current_task.bucket_counts[bucket]++;
             }
         }
         
-        current_state_ = State::PARTITIONING;
+        current_task.state = State::PARTITION;
+        LOG("bucket_counts: ");
+        for (auto bucket : current_task.bucket_counts) {
+            LOG(bucket, " ");
+        }
+        LOG("\n");
+        LOGW(" -> PARTITION\n");
     }
     
-    void handle_partitioning() {
-        if (!current_task_context_) return;
+    void handle_partition() {
+        Task& current_task = task_stack_.top();
         
-        // Calculate bucket start positions
-        current_task_context_->bucket_starts.clear();
-        current_task_context_->bucket_starts.resize(current_task_context_->bucket_counts.size() + 1);
-        current_task_context_->bucket_starts[0] = 0;
-        for (size_t i = 0; i < current_task_context_->bucket_counts.size(); ++i) {
-            current_task_context_->bucket_starts[i + 1] = current_task_context_->bucket_starts[i] + current_task_context_->bucket_counts[i];
+        LOGW("PARTITION: Starting with ", current_task.splitters.size(), " splitters\n");
+        
+        // Use in-place partitioning with std::partition for better performance (Issue #5)
+        current_task.bucket_starts.clear();
+        current_task.bucket_starts.push_back(0);
+        
+        auto current_begin = current_task.begin;
+        auto current_end = current_task.end;
+        
+        // Partition sequentially using std::partition (much faster than temporary storage)
+        for (size_t i = 0; i < current_task.splitters.size(); ++i) {
+            const auto& splitter = current_task.splitters[i];
+            
+            // Partition: elements < splitter go to the left
+            auto partition_point = std::partition(current_begin, current_end, 
+                [&](const value_type& val) { return comp_(val, splitter); });
+            
+            current_task.bucket_starts.push_back(partition_point - current_task.begin);
+            current_begin = partition_point;
         }
         
-        // Simple in-place partitioning using stable_partition
-        auto current_pos = begin_;
-        for (size_t bucket = 0; bucket < current_task_context_->splitters.size() + 1; ++bucket) {
-            if (current_task_context_->bucket_counts[bucket] == 0) continue;
-            
-            auto bucket_end = std::stable_partition(current_pos, end_, 
-                [this, bucket](const value_type& val) {
-                    // Check if element belongs to current bucket
-                    if (bucket == 0) {
-                        return current_task_context_->splitters.empty() || comp_(val, current_task_context_->splitters[0]);
-                    } else if (bucket <= current_task_context_->splitters.size()) {
-                        bool greater_than_prev = bucket == 1 || !comp_(val, current_task_context_->splitters[bucket - 1]);
-                        bool less_than_curr = bucket > current_task_context_->splitters.size() || comp_(val, current_task_context_->splitters[bucket - 1]);
-                        return greater_than_prev && less_than_curr;
-                    }
-                    return false;
-                });
-            
-            current_pos = bucket_end;
-        }
+        // Last bucket contains remaining elements
+        current_task.bucket_starts.push_back(current_end - current_task.begin);
         
-        current_state_ = State::RECURSION;
+        LOG("bucket_starts: ");
+        for (auto bucket : current_task.bucket_starts) {
+            LOG(bucket, " ");
+        }
+        LOG("\n");
+        LOGW(" -> RECURSE\n");
+        
+        current_task.state = State::RECURSE;
     }
     
-    void handle_recursion() {
-        if (current_task_context_) {
-            // Add buckets to task stack for recursive processing
-            const difference_type base_threshold = Config::kBaseCaseMultiplier * Config::kBaseCaseSize;
-            
-            // Add non-trivial buckets to task stack
-            for (size_t i = 0; i < current_task_context_->bucket_starts.size() - 1; ++i) {
-                const auto bucket_size = current_task_context_->bucket_starts[i + 1] - current_task_context_->bucket_starts[i];
-                if (bucket_size > base_threshold) {
-                    auto bucket_begin = begin_ + current_task_context_->bucket_starts[i];
-                    auto bucket_end = begin_ + current_task_context_->bucket_starts[i + 1];
-                    task_stack_.push(Task(bucket_begin, bucket_end, TaskType::MAIN_SORT));
-                }
-            }
-            
-            // Pop the completed sample sort task
-            task_stack_.pop();
-            current_task_context_ = nullptr;
-        }
+    void handle_recurse() {
+        // Extract data we need before popping to avoid expensive task copying
+        const auto& current_task = task_stack_.top();
+        const auto bucket_starts = std::move(const_cast<Task&>(current_task).bucket_starts);
+        const auto begin_iter = current_task.begin;
+        task_stack_.pop();
         
-        // Process next task or finish
-        if (task_stack_.empty()) {
-            current_state_ = State::DONE;
-        } else {
-            Task next_task = task_stack_.top();
-            task_stack_.pop();
-            begin_ = next_task.begin;
-            end_ = next_task.end;
-            current_size_ = end_ - begin_;
-            
-            // Check task type to determine next state
-            if (next_task.type == TaskType::SAMPLE_SORT) {
-                current_state_ = State::SAMPLING;
-            } else {
-                current_state_ = State::SIMPLE_CASES;
+        LOGW("RECURSE: Processing ", bucket_starts.size() - 1, " buckets\n");
+        
+        // Add buckets in reverse order for correct processing
+        for(int i = static_cast<int>(bucket_starts.size()) - 1; i > 0; --i) {
+            const int bucket_size = bucket_starts[i] - bucket_starts[i - 1];
+            LOGW("Bucket ", i-1, " size: ", bucket_size, "\n");
+            if(bucket_size > 1) {
+                auto bucket_begin = begin_iter + bucket_starts[i - 1];
+                auto bucket_end = begin_iter + bucket_starts[i];
+                // Use emplace instead of push to avoid unnecessary Task construction
+                task_stack_.emplace(bucket_begin, bucket_end, State::SIMPLE_CASES);
             }
         }
     }

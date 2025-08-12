@@ -66,19 +66,16 @@ public:
     using comparator = Comparator;
     
     struct Task {
-        std::vector<value_type> splitters;
-
-        iterator begin;
-        iterator end;
-        
-        difference_type num_samples;
-        difference_type step;
-        
-        State state; 
-        int num_buckets;
+        std::vector<value_type> splitters;  
+        iterator begin;                     
+        iterator end;                       
+        difference_type num_samples;        
+        difference_type step;               
+        int num_buckets;                    
+        State state;                        
 
         Task(iterator b, iterator e, State s = State::SIMPLE_CASES) 
-            : begin(b), end(e), state(s), num_samples(0), step(0), num_buckets(0) {}
+            : splitters(), begin(b), end(e), num_samples(0), step(0), num_buckets(0), state(s) {}
     };
 
 private:
@@ -242,6 +239,7 @@ private:
         
         // Build splitters from sorted sample
         context.splitters.clear();
+        context.splitters.reserve(context.num_buckets - 1);  // Reserve capacity to avoid reallocations
         
         if (context.num_samples > 0 && context.step > 0) {
             auto sample_end = context.begin + context.num_samples;
@@ -259,8 +257,7 @@ private:
                 }
             }
         }
-
-        // Skip classification - go directly to combined partitioning
+        
         context.state = State::PARTITION;
         LOG("splitters: ");
         for (auto splitter : context.splitters) {
